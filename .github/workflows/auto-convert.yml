@@ -1,0 +1,112 @@
+name: Auto Convert QX Rules
+
+on:
+  schedule:
+    # 每天凌晨2点自动运行
+    - cron: '0 2 * * *'
+  
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'rule.ini'
+      - 'scripts/**'
+  
+  workflow_dispatch:  # 手动触发
+    inputs:
+      force_update:
+        description: '强制更新所有规则'
+        required: false
+        default: 'false'
+      test_only:
+        description: '仅测试不提交'
+        required: false
+        default: 'false'
+
+jobs:
+  convert-rules:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        token: ${{ secrets.GH_PAT }}
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Create directories
+      run: |
+        mkdir -p rules backups logs
+    
+    - name: Backup existing rules
+      if: ${{ github.event.inputs.force_update == 'true' }}
+      run: |
+        timestamp=$(date +"%Y%m%d_%H%M%S")
+        if [ -f "rules/filter_rules.conf" ]; then
+          cp "rules/filter_rules.conf" "backups/filter_rules_${timestamp}.conf"
+        fi
+        if [ -f "rules/rewrite_rules.conf" ]; then
+          cp "rules/rewrite_rules.conf" "backups/rewrite_rules_${timestamp}.conf"
+        fi
+        echo "Rules backed up to backups/"
+    
+    - name: Convert QX rules
+      env:
+        GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+      run: |
+        python scripts/advanced_converter.py \
+          --ini rule.ini \
+          --output rules \
+          --token "$GITHUB_TOKEN"
+    
+    - name: Run tests
+      run: |
+        python scripts/test_conversion.py
+    
+    - name: Check for changes
+      id: check-changes
+      run: |
+        git add rules/ README.md conversion.log
+        if git diff --cached --quiet; then
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+        else
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Commit and push changes
+      if: ${{ steps.check-changes.outputs.has_changes == 'true' && github.event.inputs.test_only != 'true' }}
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git commit -m "chore: auto-update QX rules $(date +'%Y-%m-%d %H:%M:%S')"
+        git push origin HEAD:${{ github.ref }}
+    
+    - name: Create summary
+      if: ${{ always() }}
+      run: |
+        echo "## 🎉 规则转换完成" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📊 转换统计" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ -f "conversion.log" ]; then
+          # 提取最后几行统计信息
+          tail -20 conversion.log | grep -E "(分流规则|重写规则|DOMAIN转换|成功率)" >> $GITHUB_STEP_SUMMARY || true
+        fi
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📁 输出文件已保存到 rules/ 目录" >> $GITHUB_STEP_SUMMARY
+    
+    - name: Clean up old backups
+      if: ${{ github.event.inputs.force_update == 'true' }}
+      run: |
+        # 保留最近7天的备份
+        find backups/ -name "*.conf" -mtime +7 -delete
+        echo "Cleaned up backups older than 7 days"
